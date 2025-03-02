@@ -1,5 +1,6 @@
 import time
 from bs4 import BeautifulSoup
+from docx import Document
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox.options import Options
@@ -8,10 +9,10 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 from webdriver_manager.firefox import GeckoDriverManager
-from docx import Document
+
 import os
 
-DOC_PATH = 'potential_investors.docx'
+DOC_PATH = 'Aerospace.docx'
 
 # Load existing document or create a new one
 if os.path.exists(DOC_PATH):
@@ -25,27 +26,32 @@ else:
 existing_headings = {}
 current_level_2 = None
 current_level_3 = None
+
 for paragraph in doc.paragraphs:
     if paragraph.style.name.startswith('Heading'):
         level = int(paragraph.style.name.split()[1])
         if level == 2:
-            current_level_2 = paragraph.text
-            existing_headings[current_level_2] = {}
+            current_level_2 = paragraph.text.strip()
+            if current_level_2 not in existing_headings:
+                existing_headings[current_level_2] = {}
         elif level == 3 and current_level_2:
-            current_level_3 = paragraph.text
-            existing_headings[current_level_2][current_level_3] = []
-
+            current_level_3 = paragraph.text.split(' (')[0].strip()
+            if current_level_3 not in existing_headings[current_level_2]:
+                existing_headings[current_level_2][current_level_3] = set()
+        elif level == 4 and current_level_2 and current_level_3:
+            company_name = paragraph.text.strip()
+            existing_headings[current_level_2][current_level_3].add(company_name)
 
 def auto_select_dropdown(wait, input_field_id, field_name, user_inputs):
     retries = 3
     while retries > 0:
         user_input = input(f"Enter desired {field_name}: ").strip()
-
-        if not user_input:
-            user_inputs[field_name] = "Unknown"
-            return True
+        user_inputs[field_name] = user_input if user_input else "Unknown"
         try:
-            # Locate the input field
+            if not user_input:
+                print(f"No input provided for {field_name}; using 'Unknown'.\n")
+                return True
+
             try:
                 selector = f".css-n9qnu9 input#{input_field_id}"
                 input_field = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
@@ -55,20 +61,22 @@ def auto_select_dropdown(wait, input_field_id, field_name, user_inputs):
 
             input_field.click()
             time.sleep(1)
-
-            # Enter user input
             input_field.clear()
             input_field.send_keys(user_input)
             time.sleep(2)
 
             try:
-                options = wait.until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div[role='option']"))
-                )
+                options = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div[role='option']")))
             except TimeoutException:
-                print(f"Timeout waiting for dropdown options for {field_name}; using input as fallback.")
-                user_inputs[field_name] = user_input.upper()
-                return True
+                print(f"Timeout waiting for dropdown options for {field_name}.")
+                retries -= 1
+                if retries > 0:
+                    print(f"Retrying ({retries} attempts left)...")
+                    continue
+                else:
+                    print(f"Max retries reached; using input '{user_input.upper()}' as fallback.")
+                    user_inputs[field_name] = user_input.upper()
+                    return True
 
             found_option = None
             for option in options:
@@ -79,15 +87,25 @@ def auto_select_dropdown(wait, input_field_id, field_name, user_inputs):
             if found_option:
                 print(f"Clicking option: '{found_option.text}' for {field_name}")
                 found_option.click()
-                time.sleep(2)  # Wait for page to stabilize after click
+                time.sleep(2)
                 selected_value = user_input.upper()
                 print(f"Selected '{selected_value}' for {field_name} (based on user input).\n")
                 user_inputs[field_name] = selected_value
                 return True
             else:
-                print(f"No matching option found for {field_name} with input '{user_input}'; using input anyway.")
-                user_inputs[field_name] = user_input.upper()
-                return True
+                print(f"No matching option found for {field_name} with input '{user_input}'.")
+                retries -= 1
+                if retries > 0:
+                    retry = input(f"Try again for {field_name}? (y/n): ").strip().lower()
+                    if retry != 'y':
+                        print(f"No valid option selected; using '{user_input.upper()}' as fallback.")
+                        user_inputs[field_name] = user_input.upper()
+                        return True
+                    print(f"Retrying ({retries} attempts left)...")
+                else:
+                    print(f"Max retries reached; using input '{user_input.upper()}' as fallback.")
+                    user_inputs[field_name] = user_input.upper()
+                    return True
 
         except StaleElementReferenceException:
             print(f"Stale element encountered for {field_name}; retrying...")
@@ -104,61 +122,64 @@ def auto_select_dropdown(wait, input_field_id, field_name, user_inputs):
                 user_inputs[field_name] = user_input.upper()
                 return True
 
-        retry = input(f"Try again for {field_name}? (y/n): ").strip().lower()
-        if retry != 'y':
-            print(f"Aborting selection for {field_name}.\n")
-            return False
-
-def insert_under_heading(doc, level_2, level_3, company_name, collected_data):
+def insert_under_heading(doc, level_2, level_3, company_name, collected_data, num_results=None):
     found_level_2 = False
     found_level_3 = False
-    insert_position = len(doc.paragraphs)  # Default to end of document
+    insert_position = None
+
+    if level_2 not in existing_headings:
+        existing_headings[level_2] = {}
+    if level_3 not in existing_headings[level_2]:
+        existing_headings[level_2][level_3] = set()
+
+    company_exists = company_name in existing_headings[level_2][level_3]
+    header_text = f"{level_3} ({num_results if num_results is not None else 0})"
 
     for i, para in enumerate(doc.paragraphs):
-        if para.style.name == 'Heading 2' and para.text == level_2:
-            found_level_2 = True
-        elif found_level_2 and para.style.name == 'Heading 3' and para.text == level_3:
+        if para.style.name == 'Heading 2':
+            if para.text.strip() == level_2:
+                found_level_2 = True
+                insert_position = i + 1
+            elif found_level_2:
+                break
+        elif found_level_2 and para.style.name == 'Heading 3' and para.text.split(' (')[0].strip() == level_3:
             found_level_3 = True
-            insert_position = i + 1  # Position after the level 3 heading
-        elif found_level_2 and para.style.name == 'Heading 2':  # Another level 2 heading encountered
-            break  # Stop if we hit the next level 2 heading
+            para.text = header_text
+            insert_position = i + 1
 
-    # Insert at the determined position
     if not found_level_2:
         doc.add_heading(level_2, level=2)
-        doc.add_heading(level_3, level=3)
-        doc.add_heading(company_name, level=4)
-        for item in collected_data:
-            doc.add_paragraph(item, style='List Bullet')
+        doc.add_heading(header_text, level=3)
+        new_company = doc.add_heading(company_name, level=4)
+        if not company_exists:
+            for item in reversed(collected_data):  # Reverse the order of insertion
+                doc.add_paragraph(item, style='List Bullet')
+            existing_headings[level_2][level_3].add(company_name)
     elif not found_level_3:
-        # Find the last paragraph under the level 2 heading
-        for i, para in enumerate(doc.paragraphs):
-            if para.style.name == 'Heading 2' and para.text == level_2:
-                insert_position = i + 1
-            elif para.style.name == 'Heading 2' and i > insert_position:
-                break
-        doc.paragraphs[insert_position - 1]._element.addnext(doc.add_heading(level_3, level=3)._element)
-        doc.add_heading(company_name, level=4)
-        for item in collected_data:
-            doc.add_paragraph(item, style='List Bullet')
+        new_heading = doc.add_heading(header_text, level=3)
+        doc.paragraphs[insert_position - 1]._element.addnext(new_heading._element)
+        new_company = doc.add_heading(company_name, level=4)
+        new_heading._element.addnext(new_company._element)
+        if not company_exists:
+            for item in reversed(collected_data):  # Reverse the order of insertion
+                new_company._element.addnext(doc.add_paragraph(item, style='List Bullet')._element)
+            existing_headings[level_2][level_3].add(company_name)
     else:
-        # Insert under existing level 3 heading
-        doc.paragraphs[insert_position - 1]._element.addnext(doc.add_heading(company_name, level=4)._element)
-        for item in collected_data:
-            doc.add_paragraph(item, style='List Bullet')
+        new_company = doc.add_heading(company_name, level=4)
+        doc.paragraphs[insert_position - 1]._element.addnext(new_company._element)
+        if not company_exists:
+            for item in reversed(collected_data):  # Reverse the order of insertion
+                new_company._element.addnext(doc.add_paragraph(item, style='List Bullet')._element)
+            existing_headings[level_2][level_3].add(company_name)
+        else:
+            print(f"Company '{company_name}' already exists in '{level_2}' -> '{level_3}'; appended name only.")
 
-# Setup Selenium (outside the loop)
+# Setup Selenium
 options = Options()
 options.headless = True
-options.binary_location = "/Applications/Firefox.app/Contents/MacOS/firefox"
-
-print("Installing latest GeckoDriver...")
 driver_path = GeckoDriverManager().install()
-print(f"GeckoDriver path: {driver_path}")
-print(f"GeckoDriver version: {os.popen(f'{driver_path} --version').read()}")
 
 if not os.access(driver_path, os.X_OK):
-    print(f"Fixing permissions for {driver_path}")
     os.chmod(driver_path, 0o755)
 
 service = Service(executable_path=driver_path, port=4444, log_path="geckodriver.log")
@@ -172,7 +193,7 @@ URL = "https://www.fundssniper.com/en/search-funds"
 
 # Main loop
 while True:
-    user_inputs = {}  # Reset user inputs for each iteration
+    user_inputs = {}
     try:
         driver.get(URL)
         wait = WebDriverWait(driver, 15)
@@ -198,14 +219,24 @@ while True:
 
         time.sleep(2)
 
-        try:
-            submit_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-variant='primary']")))
-            submit_button.click()
-            print("Search button clicked.")
-        except TimeoutException:
-            print("Search button not found or not clickable.")
-
+        submit_button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-variant='primary']")))
+        submit_button.click()
+        print("Search button clicked.")
         time.sleep(4)
+
+        try:
+            results_element = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "p.font-roboto.font-semibold.text-subtitle1.m-0.undefined")))
+            results_text = results_element.text.strip()
+            num_results = int(''.join(filter(str.isdigit, results_text)))
+            print(f"Number of Results from website for this query: {num_results}")
+        except TimeoutException:
+            num_results = 0
+            print("Could not find number of results on the page.")
+
+        sector = user_inputs.get("sector-1", "Unknown")
+        fund_type = user_inputs.get("fund-type", "Unknown").upper()
+        fund_specialty = user_inputs.get("fund-specialty", "Unknown").upper()
+        category = f"{sector}-{fund_type}-{fund_specialty}"
 
         view_buttons = driver.find_elements(By.XPATH, "//button[normalize-space(text())='View']")
         visible_buttons = [btn for btn in view_buttons if btn.is_displayed()]
@@ -364,30 +395,29 @@ while True:
             if call_address:
                 collected_data.append("Call: " + call_address)
 
-            country = user_inputs.get("country to invest in", "Unknown").upper()
-            sector = user_inputs.get("sector-1", "Unknown")
+            country = user_inputs.get("fund-country", "Unknown").upper()
+            sector1 = user_inputs.get("sector-1", "Unknown")
+            sector2 = user_inputs.get("sector-2", "Unknown")
             fund_type = user_inputs.get("fund-type", "Unknown").upper()
             fund_specialty = user_inputs.get("fund-specialty", "Unknown").upper()
 
             fund_types = ["VC", "PE", "LBO", "OPPORTUNIST"]
-            fund_specialties = ["INCUBATION", "SEED", "EARLY"]
+            fund_specialties = ["INCUBATION", "SEED", "EARLY", "GROWTH"]
 
             fund_type = fund_type if fund_type in fund_types else "Unknown"
             fund_specialty = fund_specialty if fund_specialty in fund_specialties else "Unknown"
 
-            us_category = f"US FUNDS-{sector}-{fund_type}-{fund_specialty}"
-            all_category = f"{sector}-{fund_type}-{fund_specialty}"
+            us_category = f"US-FUNDS-{sector1}-{sector2}-{fund_type}-{fund_specialty}"
+            all_category = f"{sector1}-{sector2}-{fund_type}-{fund_specialty}"
 
             company_name = specific_h4_company_name.get_text(
                 strip=True) if specific_h4_company_name else "Unknown Company"
 
             if country == "US":
-                insert_under_heading(doc, "US FUNDS", us_category, company_name, collected_data)
+                insert_under_heading(doc, "US FUNDS", us_category, company_name, collected_data, num_results)
+            insert_under_heading(doc, "ALL FUNDS", all_category, company_name, collected_data, num_results)
 
-                # Insert under ALL FUNDS
-            insert_under_heading(doc, "ALL FUNDS", all_category, company_name, collected_data)
-
-            print(f"Added {company_name} to categories: {us_category if country == 'US' else ''} {all_category}")
+            print(f"Processed {company_name} for categories: {us_category if country == 'US' else ''} {all_category}")
 
             if len(driver.window_handles) > len(old_windows):
                 driver.close()
@@ -401,7 +431,6 @@ while True:
         doc.save(DOC_PATH)
         print(f"Updated document saved: {DOC_PATH}")
 
-        # Ask user if they want to continue
         continue_prompt = input(
             "\nScraping complete. Would you like to enter new values and scrape again? (y/n): ").strip().lower()
         if continue_prompt != 'y':
